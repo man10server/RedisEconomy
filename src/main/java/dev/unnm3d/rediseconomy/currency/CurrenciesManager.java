@@ -7,7 +7,6 @@ import dev.unnm3d.rediseconomy.config.CurrencySettings;
 import dev.unnm3d.rediseconomy.redis.RedisKeys;
 import dev.unnm3d.rediseconomy.redis.RedisManager;
 import dev.unnm3d.rediseconomy.transaction.EconomyExchange;
-import io.lettuce.core.ScoredValue;
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection;
 import lombok.Getter;
 import net.milkbowl.vault.economy.Economy;
@@ -16,6 +15,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.ServicePriority;
@@ -197,12 +197,11 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
      */
     public HashMap<String, UUID> resetBalanceNamePattern(String namePattern, Currency currencyReset) {
         HashMap<String, UUID> removed = new HashMap<>();
-        currencyReset.getOrderedAccounts(Integer.MAX_VALUE).thenAccept(accounts -> {
-            for (ScoredValue<String> account : accounts) {
-                UUID uuid = UUID.fromString(account.getValue());
-                if (!nameUniqueIds.containsValue(uuid)) {
-                    currencyReset.setPlayerBalance(uuid, null, 0.0);
-                }
+        Set<UUID> knownUuids = new HashSet<>(nameUniqueIds.values());
+        currencyReset.forEachAccount(account -> {
+            UUID uuid = UUID.fromString(account.getValue());
+            if (!knownUuids.contains(uuid)) {
+                currencyReset.setPlayerBalance(uuid, null, 0.0);
             }
         });
 
@@ -256,19 +255,23 @@ public class CurrenciesManager extends RedisEconomyAPI implements Listener {
     @EventHandler
     private void onJoin(PlayerJoinEvent e) {
         getCurrencies().forEach(currency ->
-                currency.getAccountRedis(e.getPlayer().getUniqueId())
-                        .thenAccept(balance -> {
-                            RedisEconomyPlugin.debug("00 Loaded " + e.getPlayer().getName() + "'s balance of " + balance + " " + currency.getCurrencyName());
+                currency.loadAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName())
+                        .thenAccept(accountLoaded -> {
+                            RedisEconomyPlugin.debug("00 Loaded " + e.getPlayer().getName() + "'s " + currency.getCurrencyName() + " account: " + accountLoaded);
 
-                            if (balance == null) {
+                            if (!accountLoaded) {
                                 currency.createPlayerAccount(e.getPlayer());
-                            } else {
-                                currency.updateAccountLocal(e.getPlayer().getUniqueId(), e.getPlayer().getName(), balance);
                             }
                         }).exceptionally(ex -> {
                             ex.printStackTrace();
                             return null;
                         }));
+    }
+
+    @EventHandler
+    private void onQuit(PlayerQuitEvent e) {
+        getCurrencies().forEach(currency -> currency.purgeAccountLocal(e.getPlayer().getUniqueId()));
+        RedisEconomyPlugin.debug("00 Purged " + e.getPlayer().getName() + "'s local account cache");
     }
 
     private CompletionStage<ConcurrentHashMap<String, UUID>> loadRedisNameUniqueIds() {

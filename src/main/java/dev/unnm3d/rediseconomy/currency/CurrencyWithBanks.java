@@ -323,8 +323,9 @@ public class CurrencyWithBanks extends Currency {
      * @return A list of accounts ordered by balance in Tuples of UUID and balance (UUID is stringified)
      */
     public CompletionStage<List<ScoredValue<String>>> getOrderedBankAccounts() {
+        // 銀行口座はプレイヤー残高とは別キーに保存される。
         return currenciesManager.getRedisManager().getConnectionAsync(connection ->
-                connection.zrevrangeWithScores(BALANCE_PREFIX + currencyName, 0, -1));
+                connection.zrevrangeWithScores(BALANCE_BANK_PREFIX + currencyName, 0, -1));
     }
 
     /**

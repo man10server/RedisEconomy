@@ -4,6 +4,9 @@ import dev.unnm3d.rediseconomy.RedisEconomyPlugin;
 import dev.unnm3d.rediseconomy.api.TransactionEvent;
 import dev.unnm3d.rediseconomy.currency.Currency;
 import dev.unnm3d.rediseconomy.redis.RedisKeys;
+import io.lettuce.core.KeyScanCursor;
+import io.lettuce.core.MapScanCursor;
+import io.lettuce.core.ScanArgs;
 import io.lettuce.core.ScriptOutputType;
 import org.bukkit.command.CommandSender;
 import org.jetbrains.annotations.NotNull;
@@ -11,11 +14,13 @@ import org.jetbrains.annotations.Nullable;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.BiConsumer;
 
 public class EconomyExchange {
 
@@ -23,6 +28,11 @@ public class EconomyExchange {
     private final ExecutorService executorService;
     private long updateTIDTimestamp = System.currentTimeMillis();
     private int lastTID = 0;
+
+    @FunctionalInterface
+    private interface TransactionConsumer {
+        void accept(long transactionId, Transaction transaction) throws IOException;
+    }
 
     /**
      * Constructor for EconomyExchange
@@ -43,30 +53,123 @@ public class EconomyExchange {
      * @return Map of transaction ids and transactions
      */
     public CompletionStage<TreeMap<Long, Transaction>> getTransactions(AccountID accountId, int limit) {
-        return CompletableFuture.supplyAsync(() ->
-                        plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection ->
-                                connection.hgetall(RedisKeys.TRANSACTIONS + accountId.toString())
-                        ), executorService)
-                .thenApply(transactions -> {
-                    if (transactions == null || transactions.isEmpty()) {
-                        return new TreeMap<Long, Transaction>();
-                    }
-
-                    final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
-                    transactions.entrySet().stream().toList().stream()
-                            .sorted(Comparator.<Map.Entry<String, String>>comparingLong(entry ->
-                                    Long.parseLong(entry.getKey())).reversed())
-                            .limit(limit)
-                            .forEach(entry -> transactionsMap.put(
-                                    Long.parseLong(entry.getKey()),
-                                    Transaction.fromString(entry.getValue())
-                            ));
-                    return transactionsMap;
-                })
+        return CompletableFuture.supplyAsync(() -> scanTransactions(accountId, limit), executorService)
                 .exceptionally(exc -> {
                     exc.printStackTrace();
                     return new TreeMap<>(); // Return empty map instead of null for better error handling
                 });
+    }
+
+    public CompletionStage<Integer> forEachTransaction(AccountID accountId, BiConsumer<Long, Transaction> transactionConsumer) {
+        return CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return streamTransactions(accountId, (transactionId, transaction) ->
+                                transactionConsumer.accept(transactionId, transaction));
+                    } catch (IOException exception) {
+                        throw new CompletionException(exception);
+                    }
+                }, executorService)
+                .exceptionally(exc -> {
+                    exc.printStackTrace();
+                    return 0;
+                });
+    }
+
+    private TreeMap<Long, Transaction> scanTransactions(AccountID accountId, int limit) {
+        final int effectiveLimit = Math.max(limit, 0);
+        final TreeMap<Long, Transaction> transactionsMap = new TreeMap<>();
+        if (effectiveLimit == 0) {
+            return transactionsMap;
+        }
+
+        final PriorityQueue<Map.Entry<Long, Transaction>> latestTransactions = effectiveLimit == Integer.MAX_VALUE ? null :
+                new PriorityQueue<>(Comparator.comparingLong(Map.Entry::getKey));
+
+        scanTransactionHash(accountId, scannedTransactions ->
+                consumeTransactionScan(scannedTransactions, effectiveLimit, transactionsMap, latestTransactions));
+
+        if (latestTransactions != null) {
+            latestTransactions.forEach(entry -> transactionsMap.put(entry.getKey(), entry.getValue()));
+        }
+        return transactionsMap;
+    }
+
+    private int streamTransactions(AccountID accountId, TransactionConsumer consumer) throws IOException {
+        final int[] streamedTransactions = {0};
+
+        try {
+            scanTransactionHash(accountId, scannedTransactions ->
+                    streamedTransactions[0] += consumeTransactionStream(scannedTransactions, consumer));
+        } catch (UncheckedIOException exception) {
+            throw exception.getCause();
+        }
+
+        return streamedTransactions[0];
+    }
+
+    private void scanTransactionHash(AccountID accountId, java.util.function.Consumer<Map<String, String>> pageConsumer) {
+        final String transactionKey = RedisKeys.TRANSACTIONS + accountId.toString();
+        plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection -> {
+            // HGETALL は履歴数に比例して巨大な Map を作るため、HSCAN で小分けに処理する。
+            MapScanCursor<String, String> cursor = connection.hscan(transactionKey);
+            pageConsumer.accept(cursor.getMap());
+
+            while (!cursor.isFinished()) {
+                cursor = connection.hscan(transactionKey, cursor);
+                pageConsumer.accept(cursor.getMap());
+            }
+            return null;
+        });
+    }
+
+    private int consumeTransactionStream(Map<String, String> scannedTransactions, TransactionConsumer consumer) {
+        if (scannedTransactions == null || scannedTransactions.isEmpty()) {
+            return 0;
+        }
+
+        int streamedTransactions = 0;
+        for (Map.Entry<String, String> entry : scannedTransactions.entrySet()) {
+            try {
+                consumer.accept(Long.parseLong(entry.getKey()), Transaction.fromString(entry.getValue()));
+                streamedTransactions++;
+            } catch (IOException exception) {
+                throw new UncheckedIOException(exception);
+            } catch (RuntimeException exception) {
+                RedisEconomyPlugin.debug("Skipping malformed transaction " + entry.getKey() + ": " + exception.getMessage());
+            }
+        }
+        return streamedTransactions;
+    }
+
+    private void consumeTransactionScan(Map<String, String> scannedTransactions,
+                                        int limit,
+                                        TreeMap<Long, Transaction> transactionsMap,
+                                        @Nullable PriorityQueue<Map.Entry<Long, Transaction>> latestTransactions) {
+        if (scannedTransactions == null || scannedTransactions.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, String> entry : scannedTransactions.entrySet()) {
+            final long transactionId;
+            final Transaction transaction;
+            try {
+                transactionId = Long.parseLong(entry.getKey());
+                transaction = Transaction.fromString(entry.getValue());
+            } catch (RuntimeException exception) {
+                RedisEconomyPlugin.debug("Skipping malformed transaction " + entry.getKey() + ": " + exception.getMessage());
+                continue;
+            }
+
+            if (latestTransactions == null) {
+                transactionsMap.put(transactionId, transaction);
+                continue;
+            }
+
+            latestTransactions.offer(Map.entry(transactionId, transaction));
+            if (latestTransactions.size() > limit) {
+                latestTransactions.poll();
+            }
+        }
     }
 
     public int getCurrentTransactionID() {
@@ -86,18 +189,26 @@ public class EconomyExchange {
      * @return How many transaction accounts were removed
      */
     public CompletionStage<Long> removeAllTransactions() {
-        return plugin.getCurrenciesManager().getRedisManager().getConnectionAsync(connection -> {
-                    try {
-                        List<String> keys = connection.keys(RedisKeys.TRANSACTIONS + "*").get();
-                        if (keys.isEmpty()) {
-                            return CompletableFuture.completedFuture(0L);
-                        }
-                        return connection.del(keys.toArray(new String[0]));
-                    } catch (InterruptedException | ExecutionException e) {
-                        throw new RuntimeException(e);
-                    }
-                }
-        );
+        return CompletableFuture.supplyAsync(() -> plugin.getCurrenciesManager().getRedisManager().getConnectionSync(connection -> {
+            // KEYS は Redis 全体をブロックしやすいので、SCAN で分割削除する。
+            final ScanArgs scanArgs = ScanArgs.Builder.matches(RedisKeys.TRANSACTIONS + "*").limit(500);
+            long deletedKeys = 0;
+            KeyScanCursor<String> cursor = connection.scan(scanArgs);
+            deletedKeys += deleteTransactionKeys(connection, cursor.getKeys());
+
+            while (!cursor.isFinished()) {
+                cursor = connection.scan(cursor, scanArgs);
+                deletedKeys += deleteTransactionKeys(connection, cursor.getKeys());
+            }
+            return deletedKeys;
+        }), executorService);
+    }
+
+    private long deleteTransactionKeys(io.lettuce.core.api.sync.RedisCommands<String, String> connection, List<String> keys) {
+        if (keys == null || keys.isEmpty()) {
+            return 0;
+        }
+        return connection.del(keys.toArray(new String[0]));
     }
 
     /**
@@ -312,27 +423,23 @@ public class EconomyExchange {
                     UUID uuid = entry.getValue();
 
                     try {
-                        AccountID accountID = new AccountID(uuid);
-                        final Map<Long, Transaction> transactionsMap = plugin.getCurrenciesManager()
-                                .getExchange()
-                                .getTransactions(accountID, Integer.MAX_VALUE)
-                                .toCompletableFuture()
-                                .join(); // Using join() is better in this context than get()
+                        final AccountID accountID = new AccountID(uuid);
+                        final boolean[] wroteHeader = {false};
+                        int transactions = streamTransactions(accountID, (transactionId, transaction) -> {
+                            if (!wroteHeader[0]) {
+                                writer.write(username);
+                                writer.write(';');
+                                writer.write(uuid.toString());
+                                writer.newLine();
+                                wroteHeader[0] = true;
+                            }
 
-                        if (transactionsMap.isEmpty()) {
-                            continue;
-                        }
-
-                        // Write account header
-                        writer.write(username);
-                        writer.write(';');
-                        writer.write(uuid.toString());
-                        writer.newLine();
-
-                        // Write transactions
-                        for (Transaction transaction : transactionsMap.values()) {
                             writer.write(transaction.toString());
                             writer.newLine();
+                        });
+
+                        if (transactions == 0) {
+                            continue;
                         }
 
                         // Add separator between accounts

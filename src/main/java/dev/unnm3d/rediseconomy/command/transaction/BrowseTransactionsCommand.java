@@ -35,40 +35,46 @@ public class BrowseTransactionsCommand extends TransactionCommandAbstract implem
         final String afterDateString = args.length == 3 ? args[1] : "anytime";
         final String beforeDateString = args.length == 3 ? args[2] : "anytime";
 
-        plugin.getCurrenciesManager().getExchange().getTransactions(accountID, Integer.MAX_VALUE).thenAccept(transactions -> {
-            long init = System.currentTimeMillis();
-            if (transactions.isEmpty()) {
+        Date afterDate = null;
+        Date beforeDate = null;
+        try {
+            if (args.length == 3) {
+                afterDate = formatDate(args[1]);
+                beforeDate = formatDate(args[2]);
+            }
+        } catch (ParseException e) {
+            plugin.langs().send(sender, plugin.langs().incorrectDate);
+            return true;
+        }
+
+        final Date finalAfterDate = afterDate;
+        final Date finalBeforeDate = beforeDate;
+        final long init = System.currentTimeMillis();
+        final int[] sentTransactions = {0};
+        final boolean[] sentHeader = {false};
+
+        // 全履歴を Map に積まず、Redis Hash をページ走査しながら条件に合うものだけ表示する。
+        plugin.getCurrenciesManager().getExchange().forEachTransaction(accountID, (transactionId, transaction) -> {
+            Date transactionDate = new Date(transaction.getTimestamp());
+            if (finalAfterDate != null)
+                if (!transactionDate.after(finalAfterDate)) return;
+            if (finalBeforeDate != null)
+                if (!transactionDate.before(finalBeforeDate)) return;
+
+            if (!sentHeader[0]) {
+                plugin.langs().send(sender, plugin.langs().transactionsStart
+                        .replace("%player%", target)
+                        .replace("%after%", afterDateString)
+                        .replace("%before%", beforeDateString));
+                sentHeader[0] = true;
+            }
+            sentTransactions[0]++;
+            sendTransaction(sender, transactionId, transaction, afterDateString + " " + beforeDateString);
+        }).thenAccept(scannedTransactions -> {
+            if (sentTransactions[0] == 0) {
                 plugin.langs().send(sender, plugin.langs().noTransactionFound.replace("%player%", target));
                 return;
             }
-
-            Date afterDate = null;
-            Date beforeDate = null;
-            try {
-                if (args.length == 3) {
-                    afterDate = formatDate(args[1]);
-                    beforeDate = formatDate(args[2]);
-                }
-            } catch (ParseException e) {
-                plugin.langs().send(sender, plugin.langs().incorrectDate);
-            }
-
-            plugin.langs().send(sender, plugin.langs().transactionsStart
-                    .replace("%player%", target)
-                    .replace("%after%", afterDateString)
-                    .replace("%before%", beforeDateString));
-            final Date finalAfterDate = afterDate;
-            final Date finalBeforeDate = beforeDate;
-            transactions.forEach((i, transaction) -> {
-                Date transactionDate = new Date(transactions.get(i).getTimestamp());
-                if (finalAfterDate != null)
-                    if (!transactionDate.after(finalAfterDate)) return;
-                if (finalBeforeDate != null)
-                    if (!transactionDate.before(finalBeforeDate)) return;
-
-                sendTransaction(sender, i, transaction, afterDateString + " " + beforeDateString);
-            });
-
             plugin.langs().send(sender, plugin.langs().transactionsEnd
                     .replace("%player%", target)
                     .replace("%time%", String.valueOf(System.currentTimeMillis() - init)));
