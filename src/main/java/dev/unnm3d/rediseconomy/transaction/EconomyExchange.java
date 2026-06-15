@@ -404,7 +404,7 @@ public class EconomyExchange {
      * @param archivePath Path to the archive file where transactions will be saved
      * @return A CompletionStage that completes with the number of archived accounts
      */
-    public CompletionStage<Integer> archiveTransactions(CommandSender sender, Path archivePath) {
+    public CompletionStage<Integer> archiveTransactions(CommandSender sender, Path archivePath, boolean deleteAfterArchive) {
         // Create parent directories if they don't exist
         try {
             Files.createDirectories(archivePath.getParent());
@@ -463,11 +463,15 @@ public class EconomyExchange {
 
             return archivedCount;
         }).thenCompose(archivedCount -> {
-            if (archivedCount <= 0) {
+            if (archivedCount <= 0 || !deleteAfterArchive) {
+                plugin.getScheduler().runTask(() ->
+                        plugin.langs().send(sender, plugin.langs().transactionsArchiveCompleted
+                                .replace("%size%", String.valueOf(archivedCount))
+                                .replace("%file%", archivePath.getFileName().toString())));
                 return CompletableFuture.completedStage(archivedCount);
             }
 
-            // Remove transactions only if archiving was successful
+            // Redis の履歴削除は復元が難しいため、コマンド側で明示フラグがある場合だけ実行する。
             return plugin.getCurrenciesManager().getExchange().removeAllTransactions()
                     .thenApply(deletedCount -> {
                         plugin.getScheduler().runTask(() ->
